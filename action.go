@@ -1,65 +1,90 @@
 package selector
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
-type Status uint8 // 动作状态
+type Action interface {
+	Agree()
+	Refuse()
+	Deadline() time.Time
+	AddHandler(State, func())
+}
+
+type State uint8 // 动作状态
 
 const (
-	_statusDefault Status = iota // 默认状态
-	StatusAgree                  // 同意
-	StatusRefuse                 // 拒绝
-	StatusTimeout                // 超时
+	_statusDefault State = iota // 默认状态
+	StateAgree                  // 同意
+	StateRefuse                 // 拒绝
+	StateTimeout                // 超时
 	_end
 )
 
-func (s Status) valid() bool {
+func (s State) valid() bool {
 	return s < _end && s > _statusDefault
 }
 
-type handler map[Status]func()
+type Handler map[State]func()
 
-func (h handler) add(status Status, fn func()) {
+func (h Handler) add(status State, fn func()) {
 	h[status] = fn
 }
 
-func (h handler) get(status Status) func() {
+func (h Handler) get(status State) func() {
 	return h[status]
 }
 
-type Action struct {
+type action struct {
 	priority uint   // 优先级
-	status   Status // 状态
-	event    *Event
-	handler  handler // action对应的handler
+	state    State  // 状态
+	event    *Event // Event
+
+	mu      sync.Mutex
+	handler Handler // action对应的handler
 }
 
-func (ac *Action) Deadline() time.Time {
+func (ac *action) AddHandler(s State, fn func()) {
+	if !s.valid() {
+		return
+	}
+	ac.mu.Lock()
+	if ac.handler == nil {
+		ac.handler = make(Handler)
+	}
+	ac.handler.add(s, fn)
+	ac.mu.Unlock()
+}
+
+func (ac *action) Deadline() time.Time {
 	return ac.event.deadline
 }
 
-func (ac *Action) Agree() {
-	if ac.status != _statusDefault || !ac.event.isRunning() {
+func (ac *action) Agree() {
+	if ac.state != _statusDefault || !ac.event.isRunning() {
 		return
 	}
-	ac.status = StatusAgree
-	ac.event.finish(false)
+	ac.event.makeDecision(StateAgree, ac)
+	ac.event.notify <- ac
 }
 
-func (ac *Action) Refuse() {
-	if ac.status != _statusDefault || !ac.event.isRunning() {
+func (ac *action) Refuse() {
+	if ac.state != _statusDefault || !ac.event.isRunning() {
 		return
 	}
-	ac.status = StatusRefuse
-	if ac.event.mode == ModeUnited {
-		h := ac.event.handler.get(StatusRefuse)
-		if h != nil {
-			h()
-		}
-	}
-	ac.event.finish(false)
+	ac.event.makeDecision(StateRefuse, ac)
+	ac.event.notify <- ac
 }
 
-type actionList []*Action
+func (ac *action) timeout() {
+	if ac.state != _statusDefault {
+		return
+	}
+	ac.state = StateTimeout
+}
+
+type actionList []*action
 
 func (al actionList) Len() int {
 	return len(al)

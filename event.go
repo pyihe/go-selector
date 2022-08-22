@@ -1,6 +1,7 @@
 package selector
 
 import (
+	"errors"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -8,182 +9,233 @@ import (
 )
 
 const (
-	ModeIndependent = 1 // 每个Event执行自己的Handler
-	ModeUnited      = 2 // 所有Event执行统一的Handler
+	running = 1
+	closed  = 2
+)
+
+var (
+	ErrEventIsRunning = errors.New("cannot add action when event running")
 )
 
 type Event struct {
-	mode       uint8
-	mu         sync.Mutex
-	running    int32
-	actionList actionList
-	handler    handler
-	deadline   time.Time
+	status int32 // Event运行状态
+
+	mu            sync.Mutex   // Mutex
+	priorityCount map[uint]int // <priority, count>
+	actionList    actionList   // Event对应的动作
+
+	deadline  time.Time    // Event截止时间
+	notify    chan *action //
+	OnTimeout func()       // Event超时后默认执行的Handler
 }
 
-func NewEvent(mode uint8) *Event {
+func NewEvent(handler func()) *Event {
 	return &Event{
-		mode:       mode,
-		mu:         sync.Mutex{},
-		running:    0,
-		actionList: make(actionList, 0, 16),
-		handler:    nil,
-		deadline:   time.Time{},
+		status:        0,
+		mu:            sync.Mutex{},
+		priorityCount: make(map[uint]int),
+		actionList:    make(actionList, 0, 16),
+		OnTimeout:     handler,
+		notify:        make(chan *action, 16),
 	}
 }
 
-func (e *Event) AddHandler(status Status, fn func()) {
-	if e.isRunning() {
-		return
+func (e *Event) AddAction(priority uint) (Action, error) {
+	if !e.isInit() {
+		return nil, ErrEventIsRunning
 	}
-	if status.valid() == false {
-		return
-	}
-	if e.mode != ModeUnited {
-		return
-	}
-	e.mu.Lock()
-	if e.handler == nil {
-		e.handler = make(handler)
-	}
-	e.handler[status] = fn
-	e.mu.Unlock()
-}
-
-func (e *Event) AddAction(priority uint) *Action {
-	if e.isRunning() {
-		return nil
-	}
-	ac := &Action{
+	ac := &action{
 		priority: priority,
-		status:   _statusDefault,
+		state:    _statusDefault,
 		event:    e,
 		handler:  nil,
 	}
 	e.mu.Lock()
 	e.actionList = append(e.actionList, ac)
+	e.priorityCount[priority] += 1
 	e.mu.Unlock()
-	return ac
+	return ac, nil
+}
+
+func (e *Event) AddActionWithHandler(priority uint, handler Handler) (Action, error) {
+	if !e.isInit() {
+		return nil, ErrEventIsRunning
+	}
+	ac := &action{
+		priority: priority,
+		state:    _statusDefault,
+		event:    e,
+		handler:  handler,
+	}
+	e.mu.Lock()
+	e.actionList = append(e.actionList, ac)
+	e.priorityCount[priority] += 1
+	e.mu.Unlock()
+	return ac, nil
 }
 
 func (e *Event) Start(timeout time.Duration) {
-	if e.isRunning() {
+	if !atomic.CompareAndSwapInt32(&e.status, 0, running) {
 		return
 	}
-	atomic.StoreInt32(&e.running, 1)
 	e.deadline = time.Now().Add(timeout)
 
-	time.AfterFunc(timeout, func() {
-		e.setTimeoutStatus()
-		e.finish(true)
-	})
+	e.mu.Lock()
+	sort.Sort(e.actionList)
+	e.mu.Unlock()
+
+	go func() {
+		timer := time.NewTimer(timeout)
+
+		defer func() {
+			if timer != nil {
+				timer.Stop()
+			}
+			e.Reset()
+		}()
+
+		for {
+			select {
+			case <-timer.C:
+				e.finish(nil)
+				return
+			case ac, ok := <-e.notify:
+				if ok {
+					if e.finish(ac) {
+						return
+					}
+				}
+			}
+		}
+	}()
 }
 
-func (e *Event) finish(timeout bool) {
-	allDone := e.isActionDone()
-
-	if !timeout && !allDone {
-		return
+func (e *Event) Reset() {
+	if e.isClosed() {
+		close(e.notify)
+		*e = Event{
+			status:    0,
+			OnTimeout: nil,
+			deadline:  time.Time{},
+			notify:    make(chan *action, 16),
+		}
+		e.mu.Lock()
+		e.actionList = e.actionList[0:0]
+		e.priorityCount = make(map[uint]int)
+		e.mu.Unlock()
 	}
+}
 
-	agrees, _, overs := e.classify()
+func (e *Event) finish(ac *action) (done bool) {
+	defer func() {
+		if done {
+			atomic.StoreInt32(&e.status, closed)
+		}
+	}()
+
+	var allAction actionList
+	var timeout = ac == nil // 是否超时
+
+	e.mu.Lock()
+	if timeout {
+		// 超时将尚未决策的action状态置为Timeout
+		for _, a := range e.actionList {
+			a.timeout()
+		}
+	}
+	allAction = e.actionList
+	e.mu.Unlock()
+
+	// Event决策结束的条件:
+	// 1. 当前优先级最高的Action做完决策, 立即执行该优先级对应的所有Action
+	// 2. 所有Action均做出决策(或Agree或Refuse)
+	// 3. 决策超时
 
 	switch {
-	case timeout:
-		switch e.mode {
-		case ModeIndependent:
-			// 如果有做出决策的action, 选择优先级最高的执行
-			if len(agrees) > 0 {
-				sort.Sort(agrees)
-				for _, ac := range agrees {
-					if ac.priority == agrees[0].priority {
-						if h := ac.handler.get(StatusAgree); h != nil {
-							h()
-						}
-					}
+	case timeout: // 超时
+		// 判断是否有Agree的action
+		for i, a := range allAction {
+			switch a.state {
+			case StateTimeout: // 执行Action的超时Handler
+				if h := a.handler.get(StateTimeout); h != nil {
+					h()
 				}
-			}
-
-			// 如果没有action做出决策，则执行每个超时action对应的超时handler
-			if len(overs) > 0 {
-				for _, ac := range overs {
-					if h := ac.handler.get(StatusTimeout); h != nil {
-						h()
-					}
-				}
-			}
-		case ModeUnited:
-			agreeHandler := e.handler.get(StatusAgree)
-			overHandler := e.handler.get(StatusTimeout)
-			if len(agrees) > 0 {
-				sort.Sort(agrees)
-				for _, ac := range agrees {
-					if ac.priority == agrees[0].priority {
-						if agreeHandler != nil {
-							agreeHandler()
-						}
-					}
-				}
-			}
-			if len(overs) > 0 {
-				for _, ac := range overs {
-					if ac.status == StatusTimeout {
-						if overHandler != nil {
-							overHandler()
-						}
-					}
-				}
-			}
-		}
-	default: // 没有超时，证明所有action都做出了决策，此时选择优先级最高的执行即可
-		sort.Sort(agrees)
-		h := e.handler.get(StatusAgree)
-		switch e.mode {
-		case ModeIndependent:
-			for _, ac := range agrees {
-				if ac.priority == agrees[0].priority {
-					if ah := ac.handler.get(StatusAgree); ah != nil {
-						ah()
-					}
-				}
-			}
-		case ModeUnited:
-			if h != nil {
-				for _, ac := range agrees {
-					if ac.priority == agrees[0].priority {
-						h()
-					}
+			case StateAgree:
+				if !done {
+					e.exec(allAction, a.priority, i)
+					done = true
 				}
 			}
 		}
 
+	default: // 有action做出决策
+		for _, a := range allAction {
+			switch a.state {
+			case StateAgree: //
+				if !done {
+					if e.hasMadeDecision(allAction, a.priority) {
+						e.exec(allAction, a.priority, -1)
+						done = true
+						return
+					}
+					return
+				}
+			case _statusDefault:
+				return
+			}
+		}
 	}
+
+	// 如果没有Agree的action, 需要执行Event的Handler
+	if !done {
+		done = true
+		if e.OnTimeout != nil {
+			e.OnTimeout()
+		}
+	}
+
 	return
 }
 
-func (e *Event) isRunning() bool {
-	return atomic.LoadInt32(&e.running) == 1
-}
-
-func (e *Event) setTimeoutStatus() {
-	e.mu.Lock()
-	actions := e.actionList
-	e.mu.Unlock()
-	for _, ac := range actions {
-		if ac.status == _statusDefault {
-			ac.status = StatusTimeout
+func (e *Event) exec(list actionList, priority uint, idx int) {
+	if idx >= 0 {
+		n := e.priorityCount[priority]
+		switch {
+		case n > 1:
+			for _, ac := range list[idx : idx+n] {
+				if ac.state != StateAgree {
+					continue
+				}
+				if h := ac.handler.get(StateAgree); h != nil {
+					h()
+				}
+			}
+		default:
+			if h := list[idx].handler.get(StateAgree); h != nil {
+				h()
+			}
+		}
+	} else {
+		for _, ac := range list {
+			if ac.priority == priority && ac.state == StateAgree {
+				if h := ac.handler.get(StateAgree); h != nil {
+					h()
+				}
+			}
 		}
 	}
 }
 
-func (e *Event) isActionDone() (ok bool) {
-	e.mu.Lock()
-	actions := e.actionList
-	e.mu.Unlock()
-
+func (e *Event) hasMadeDecision(list actionList, priority uint) (ok bool) {
 	ok = true
-	for _, ac := range actions {
-		if ac.status == _statusDefault {
+	for _, ac := range list {
+		if ac.priority > priority {
+			continue
+		}
+		if ac.priority < priority {
+			break
+		}
+		if ac.state == _statusDefault {
 			ok = false
 			break
 		}
@@ -191,21 +243,30 @@ func (e *Event) isActionDone() (ok bool) {
 	return
 }
 
-func (e *Event) classify() (agrees actionList, refuses actionList, timeouts actionList) {
+func (e *Event) makeDecision(state State, ac *action) {
 	e.mu.Lock()
-	actions := e.actionList
-	e.mu.Unlock()
-
-	for _, ac := range actions {
-		ac := ac
-		switch ac.status {
-		case StatusAgree:
-			agrees = append(agrees, ac)
-		case StatusRefuse:
-			refuses = append(refuses, ac)
-		case StatusTimeout:
-			timeouts = append(timeouts, ac)
+	for _, a := range e.actionList {
+		if a == ac {
+			a.state = state
+			if state == StateRefuse {
+				if h := a.handler.get(StateRefuse); h != nil {
+					h()
+				}
+			}
+			break
 		}
 	}
-	return
+	e.mu.Unlock()
+}
+
+func (e *Event) isInit() bool {
+	return atomic.LoadInt32(&e.status) == 0
+}
+
+func (e *Event) isRunning() bool {
+	return atomic.LoadInt32(&e.status) == running
+}
+
+func (e *Event) isClosed() bool {
+	return atomic.LoadInt32(&e.status) == closed
 }
